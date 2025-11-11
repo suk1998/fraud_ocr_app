@@ -43,7 +43,7 @@ def ocr_image_bytes(b: bytes) -> str:
         return ocr_pil(im)
 
 def pdf_text_or_ocr_bytes(b: bytes) -> str:
-    # 1) Try extracting text directly (text-based PDF)
+    # 1) 텍스트 PDF 시도
     try:
         t_all, n = [], 0
         with pdfplumber.open(io.BytesIO(b)) as pdf:
@@ -55,7 +55,7 @@ def pdf_text_or_ocr_bytes(b: bytes) -> str:
             return "\n".join(t_all)
     except Exception:
         pass
-    # 2) If scanned PDF → convert to image and run OCR
+    # 2) 스캔 PDF → OCR
     texts = []
     for page_img in convert_from_bytes(b, dpi=300):
         texts.append(ocr_pil(page_img))
@@ -63,7 +63,6 @@ def pdf_text_or_ocr_bytes(b: bytes) -> str:
 
 def do_ocr_any(name: str, content: bytes) -> dict:
     ext = Path(name).suffix.lower()
-    text = ""
     try:
         if ext in IMG_EXT:
             text = ocr_image_bytes(content)
@@ -78,7 +77,7 @@ def do_ocr_any(name: str, content: bytes) -> dict:
 # ---- UI ----
 st.set_page_config(page_title="Fraud OCR Extractor", layout="wide")
 st.title("🧠 Fraud OCR Extractor (Images + PDF + ZIP)")
-st.caption("Upload images (JPG/PNG), PDFs, or ZIP folders — the server will perform OCR and let you download results as CSV or TXT.")
+st.caption("Upload images (JPG/PNG), PDFs, or ZIP — download results as **Excel, CSV, or TXT**.")
 
 tab1, tab2 = st.tabs(["📁 Upload Files", "📦 Upload Folder (ZIP)"])
 
@@ -114,7 +113,7 @@ if results:
     st.subheader("📋 Preview of Results")
     st.dataframe(df, use_container_width=True, height=400)
 
-    # ---- CSV download ----
+    # ---- CSV ----
     csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         "📥 Download CSV (ocr_results.csv)",
@@ -123,7 +122,18 @@ if results:
         mime="text/csv"
     )
 
-    # ---- TXT (single combined) ----
+    # ---- Excel (.xlsx) ----
+    xlsx_buf = io.BytesIO()
+    with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="ocr_results")
+    st.download_button(
+        "📥 Download Excel (ocr_results.xlsx)",
+        data=xlsx_buf.getvalue(),
+        file_name="ocr_results.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    # ---- TXT (combined) ----
     combined = []
     for _, row in df.iterrows():
         combined.append(f"===== {row['filename']} =====\n{row['text']}\n")
@@ -135,11 +145,10 @@ if results:
         mime="text/plain"
     )
 
-    # ---- TXT (per-file .txt inside ZIP) ----
+    # ---- TXT per-file ZIP ----
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
         for _, row in df.iterrows():
-            # sanitize filename for txt
             base = Path(row["filename"]).stem
             safe = "".join(c for c in base if c not in '\\/:*?"<>|').strip() or "file"
             z.writestr(f"{safe}.txt", row["text"] or "")
@@ -152,3 +161,4 @@ if results:
     )
 else:
     st.info("Please upload files or a ZIP folder from the tabs above.")
+
