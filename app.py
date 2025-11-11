@@ -90,7 +90,7 @@ tab1, tab2 = st.tabs(["📁 Upload Files", "📦 Upload Folder (ZIP)"])
 # 파일 저장 이름 옵션
 with st.sidebar:
     st.subheader("💾 Export Options")
-    base_input = st.text_input("Base file name", value="ocr_results", help="확장자는 자동으로 붙습니다.")
+    base_input = st.text_input("Base file name", value="ocr_results", help="The file extension is added automatically.")
     add_ts = st.checkbox("Append timestamp (YYYYMMDD_HHMMSS)", value=False)
     from datetime import datetime
     base_name = sanitize_basename(base_input)
