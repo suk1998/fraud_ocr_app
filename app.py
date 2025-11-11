@@ -1,5 +1,5 @@
 # app.py
-import os, io, zipfile, tempfile, platform, shutil, re
+import os, io, zipfile, platform, shutil
 from pathlib import Path
 import streamlit as st
 import pandas as pd
@@ -37,7 +37,9 @@ def ocr_pil(img: Image.Image, lang="eng+kor") -> str:
     return pytesseract.image_to_string(_preprocess(img), lang=lang, config="--oem 3 --psm 6")
 
 def ocr_image_bytes(b: bytes) -> str:
-    with Image.open(io.BytesIO(b)) as im:
+    from PIL import Image
+    import io as _io
+    with Image.open(_io.BytesIO(b)) as im:
         return ocr_pil(im)
 
 def pdf_text_or_ocr_bytes(b: bytes) -> str:
@@ -68,15 +70,15 @@ def do_ocr_any(name: str, content: bytes) -> dict:
         elif ext in PDF_EXT:
             text = pdf_text_or_ocr_bytes(content)
         else:
-            return {"filename": name, "chars": 0, "text": f"Unsupported file type: {ext}"}
+            return {"filename": name, "text": f"Unsupported file type: {ext}"}
     except Exception as e:
-        return {"filename": name, "chars": 0, "text": f"⚠️ OCR error: {e}"}
-    return {"filename": name, "chars": len(text or ""), "text": (text or "").strip()}
+        return {"filename": name, "text": f"⚠️ OCR error: {e}"}
+    return {"filename": name, "text": (text or "").strip()}
 
 # ---- UI ----
 st.set_page_config(page_title="Fraud OCR Extractor", layout="wide")
 st.title("🧠 Fraud OCR Extractor (Images + PDF + ZIP)")
-st.caption("Upload images (JPG/PNG), PDFs, or ZIP folders — the server will perform OCR and let you download results as Excel.")
+st.caption("Upload images (JPG/PNG), PDFs, or ZIP folders — the server will perform OCR and let you download results as CSV or TXT.")
 
 tab1, tab2 = st.tabs(["📁 Upload Files", "📦 Upload Folder (ZIP)"])
 
@@ -84,7 +86,7 @@ results = []
 
 with tab1:
     up = st.file_uploader(
-        "Select multiple image or PDF files", 
+        "Select multiple image or PDF files",
         type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "pdf"],
         accept_multiple_files=True
     )
@@ -103,24 +105,50 @@ with tab2:
                         continue
                     name = zi.filename
                     ext = Path(name).suffix.lower()
-                    if ext in IMG_EXT | PDF_EXT:
+                    if ext in (IMG_EXT | PDF_EXT):
                         content = zf.read(zi)
                         results.append(do_ocr_any(Path(name).name, content))
 
 if results:
-    df = pd.DataFrame(results)
+    df = pd.DataFrame(results, columns=["filename", "text"])
     st.subheader("📋 Preview of Results")
     st.dataframe(df, use_container_width=True, height=400)
 
-    # Create Excel file
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as w:
-        df.to_excel(w, index=False, sheet_name="ocr_results")
+    # ---- CSV download ----
+    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
-        "📥 Download Excel (ocr_results.xlsx)",
-        data=out.getvalue(),
-        file_name="ocr_results.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        "📥 Download CSV (ocr_results.csv)",
+        data=csv_bytes,
+        file_name="ocr_results.csv",
+        mime="text/csv"
+    )
+
+    # ---- TXT (single combined) ----
+    combined = []
+    for _, row in df.iterrows():
+        combined.append(f"===== {row['filename']} =====\n{row['text']}\n")
+    combined_txt = "\n".join(combined).encode("utf-8-sig")
+    st.download_button(
+        "📥 Download TXT (combined_ocr.txt)",
+        data=combined_txt,
+        file_name="combined_ocr.txt",
+        mime="text/plain"
+    )
+
+    # ---- TXT (per-file .txt inside ZIP) ----
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
+        for _, row in df.iterrows():
+            # sanitize filename for txt
+            base = Path(row["filename"]).stem
+            safe = "".join(c for c in base if c not in '\\/:*?"<>|').strip() or "file"
+            z.writestr(f"{safe}.txt", row["text"] or "")
+    zip_buf.seek(0)
+    st.download_button(
+        "📥 Download TXT (per-file ZIP: ocr_texts.zip)",
+        data=zip_buf.getvalue(),
+        file_name="ocr_texts.zip",
+        mime="application/zip"
     )
 else:
     st.info("Please upload files or a ZIP folder from the tabs above.")
