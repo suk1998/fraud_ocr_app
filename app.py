@@ -1,5 +1,5 @@
 # app.py
-import os, io, zipfile, platform, shutil
+import os, io, zipfile, platform, shutil, re
 from pathlib import Path
 import streamlit as st
 import pandas as pd
@@ -25,7 +25,7 @@ _auto_set_tesseract()
 IMG_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 PDF_EXT = {".pdf"}
 
-# ---- Image preprocessing + OCR ----
+# ---- helpers ----
 def _preprocess(img: Image.Image) -> Image.Image:
     g = ImageOps.grayscale(img)
     g = ImageOps.autocontrast(g)
@@ -43,7 +43,6 @@ def ocr_image_bytes(b: bytes) -> str:
         return ocr_pil(im)
 
 def pdf_text_or_ocr_bytes(b: bytes) -> str:
-    # 1) 텍스트 PDF 시도
     try:
         t_all, n = [], 0
         with pdfplumber.open(io.BytesIO(b)) as pdf:
@@ -55,7 +54,6 @@ def pdf_text_or_ocr_bytes(b: bytes) -> str:
             return "\n".join(t_all)
     except Exception:
         pass
-    # 2) 스캔 PDF → OCR
     texts = []
     for page_img in convert_from_bytes(b, dpi=300):
         texts.append(ocr_pil(page_img))
@@ -74,12 +72,30 @@ def do_ocr_any(name: str, content: bytes) -> dict:
         return {"filename": name, "text": f"⚠️ OCR error: {e}"}
     return {"filename": name, "text": (text or "").strip()}
 
+# 안전한 파일명 만들기
+def sanitize_basename(s: str) -> str:
+    s = s.strip()
+    if not s:
+        s = "ocr_results"
+    s = re.sub(r'[\\/:*?"<>|]+', "_", s)  # 금지문자 대체
+    return s[:120]  # 너무 길면 컷
+
 # ---- UI ----
 st.set_page_config(page_title="Fraud OCR Extractor", layout="wide")
 st.title("🧠 Fraud OCR Extractor (Images + PDF + ZIP)")
-st.caption("Upload images (JPG/PNG), PDFs, or ZIP — download results as **Excel, CSV, or TXT**.")
+st.caption("Upload images (JPG/PNG), PDFs, or ZIP — download results as Excel / CSV / TXT.")
 
 tab1, tab2 = st.tabs(["📁 Upload Files", "📦 Upload Folder (ZIP)"])
+
+# 파일 저장 이름 옵션
+with st.sidebar:
+    st.subheader("💾 Export Options")
+    base_input = st.text_input("Base file name", value="ocr_results", help="확장자는 자동으로 붙습니다.")
+    add_ts = st.checkbox("Append timestamp (YYYYMMDD_HHMMSS)", value=False)
+    from datetime import datetime
+    base_name = sanitize_basename(base_input)
+    if add_ts:
+        base_name = f"{base_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 results = []
 
@@ -113,52 +129,49 @@ if results:
     st.subheader("📋 Preview of Results")
     st.dataframe(df, use_container_width=True, height=400)
 
-    # ---- CSV ----
-    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+    # CSV
     st.download_button(
-        "📥 Download CSV (ocr_results.csv)",
-        data=csv_bytes,
-        file_name="ocr_results.csv",
+        "📥 Download CSV",
+        data=df.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"{base_name}.csv",
         mime="text/csv"
     )
 
-    # ---- Excel (.xlsx) ----
+    # Excel
     xlsx_buf = io.BytesIO()
     with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as w:
         df.to_excel(w, index=False, sheet_name="ocr_results")
     st.download_button(
-        "📥 Download Excel (ocr_results.xlsx)",
+        "📘 Download Excel",
         data=xlsx_buf.getvalue(),
-        file_name="ocr_results.xlsx",
+        file_name=f"{base_name}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    # ---- TXT (combined) ----
+    # TXT (combined)
     combined = []
     for _, row in df.iterrows():
         combined.append(f"===== {row['filename']} =====\n{row['text']}\n")
-    combined_txt = "\n".join(combined).encode("utf-8-sig")
     st.download_button(
-        "📥 Download TXT (combined_ocr.txt)",
-        data=combined_txt,
-        file_name="combined_ocr.txt",
+        "📄 Download TXT (combined)",
+        data="\n".join(combined).encode("utf-8-sig"),
+        file_name=f"{base_name}.txt",
         mime="text/plain"
     )
 
-    # ---- TXT per-file ZIP ----
+    # TXT per-file ZIP
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
         for _, row in df.iterrows():
-            base = Path(row["filename"]).stem
-            safe = "".join(c for c in base if c not in '\\/:*?"<>|').strip() or "file"
+            stem = Path(row["filename"]).stem
+            safe = sanitize_basename(stem) or "file"
             z.writestr(f"{safe}.txt", row["text"] or "")
     zip_buf.seek(0)
     st.download_button(
-        "📥 Download TXT (per-file ZIP: ocr_texts.zip)",
+        "💾 Download TXT (per-file ZIP)",
         data=zip_buf.getvalue(),
-        file_name="ocr_texts.zip",
+        file_name=f"{base_name}_texts.zip",
         mime="application/zip"
     )
 else:
     st.info("Please upload files or a ZIP folder from the tabs above.")
-
