@@ -1,6 +1,6 @@
 # app.py
-# Fraud OCR Extractor: OCR -> Clean -> (Rule + Optional AI Agent) -> Excel/CSV + Readable TXT
-# 2025-12-19
+# Fraud OCR Extractor: OCR -> Text Clean -> Rule Extraction (+ Optional AI Agent) -> Excel/CSV + Readable TXT
+# 2025-12-20
 
 import os
 import io
@@ -19,7 +19,11 @@ import pytesseract
 import pdfplumber
 from pdf2image import convert_from_bytes
 
-from ai_agent import extract_fields_with_agent
+# Optional AI agent import (keep app runnable even if file is missing)
+try:
+    from ai_agent import extract_fields_with_agent
+except Exception:
+    extract_fields_with_agent = None
 
 
 # -----------------------------
@@ -72,7 +76,7 @@ def ocr_image_bytes(b: bytes) -> str:
 
 def pdf_text_or_ocr_bytes(b: bytes) -> str:
     """Extract text from a PDF; if not text-based, OCR each page."""
-    # 1) Direct text extraction
+    # 1) Direct text extraction (text-based PDFs)
     try:
         t_all, n = [], 0
         with pdfplumber.open(io.BytesIO(b)) as pdf:
@@ -85,7 +89,7 @@ def pdf_text_or_ocr_bytes(b: bytes) -> str:
     except Exception:
         pass
 
-    # 2) OCR fallback for scanned PDFs
+    # 2) OCR fallback (scanned PDFs)
     texts = []
     for page_img in convert_from_bytes(b, dpi=300):
         texts.append(ocr_pil(page_img))
@@ -122,7 +126,11 @@ DEFAULT_REPLACEMENTS = [
 
 
 def clean_ocr_text(t: str, collapse_ws: bool = True) -> str:
-    """Cleaning for extraction (keep meaning, reduce OCR noise)."""
+    """
+    Cleaning for extraction:
+    - Keep line breaks as much as possible (labels rely on structure)
+    - Normalize common OCR artifacts
+    """
     if not t:
         return ""
 
@@ -130,12 +138,15 @@ def clean_ocr_text(t: str, collapse_ws: bool = True) -> str:
     for a, b in DEFAULT_REPLACEMENTS:
         s = s.replace(a, b)
 
-    # Remove some common UI junk but do not over-delete
+    # Remove some decorative symbols often produced by OCR
     s = re.sub(r"[©®™]", " ", s)
 
     if collapse_ws:
+        # Keep newlines, only collapse excessive spaces
         s = re.sub(r"[ \t]+", " ", s)
-        s = re.sub(r"\s*\n\s*", "\n", s)
+        # Normalize CRLF
+        s = s.replace("\r\n", "\n").replace("\r", "\n")
+        # Reduce too many blank lines
         s = re.sub(r"\n{3,}", "\n\n", s)
 
     return s.strip()
@@ -150,21 +161,16 @@ def clean_text_for_txt(t: str) -> str:
     for a, b in DEFAULT_REPLACEMENTS:
         s = s.replace(a, b)
 
-    # Remove decorative symbols often produced by OCR
     s = re.sub(r"[©®™@•■◆●◼︎]", " ", s)
-
-    # Normalize whitespace
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
-
-    # Remove isolated single-letter junk tokens (optional, conservative)
-    s = re.sub(r"(?m)^\s*[A-Za-z]\s*$", "", s)
 
     return s.strip()
 
 
 # -----------------------------
-# Robust label utilities for rule-based extraction
+# Robust label/block extraction (Rule-based)
 # -----------------------------
 def spaced_label_regex(label: str) -> str:
     """Match labels even if OCR inserts spaces between letters."""
@@ -176,26 +182,92 @@ def spaced_label_regex(label: str) -> str:
     return r"\s+".join(word_pat(p) for p in parts)
 
 
-def compile_after_label(label: str, tail_regex: str, flags=re.IGNORECASE) -> re.Pattern:
+def _block_after_label(text: str, label: str, max_chars: int = 400) -> str:
+    """
+    Capture a block right after a label, either:
+    - Same line: 'SENDER: JOHN DOE'
+    - Next lines:
+        SENDER:
+        JOHN DOE
+        123 STREET...
+    Stop when another ALL-CAPS label-like line starts.
+    """
     lab = spaced_label_regex(label)
-    pat = lab + tail_regex
-    return re.compile(pat, flags)
+
+    # 1) Same-line capture
+    m = re.search(rf"(?im)^[ \t]*{lab}\s*[:\-]?\s*([^\n\r]{{2,{max_chars}}})$", text)
+    if m:
+        return (m.group(1) or "").strip()
+
+    # 2) Multi-line block capture
+    m = re.search(rf"(?im)^[ \t]*{lab}\s*[:\-]?\s*(?:\r?\n)+", text)
+    if not m:
+        return ""
+
+    start = m.end()
+    tail = text[start : start + 2000]
+
+    # Stop conditions: a new label line (heuristic)
+    # Example: 'RECIPIENT:' or 'RECIPIENT BANK:' or 'Amount to be ...'
+    stop = re.search(r"(?m)^\s*[A-Z][A-Z0-9 /&().'-]{2,40}\s*:\s*$", tail)
+    if stop:
+        tail = tail[: stop.start()]
+
+    return tail[:max_chars].strip()
 
 
-def compile_line_after_label(label: str) -> re.Pattern:
-    """Capture first non-empty line after a label at line start."""
-    lab = spaced_label_regex(label)
-    pat = r"(?im)^[ \t]*" + lab + r"\s*[:\-]?\s*(?:\r?\n)+\s*([^\r\n]{2,200})"
-    return re.compile(pat)
+def _pick_name_from_block(block: str) -> str | None:
+    """
+    Choose a plausible 'name/company' line from a block.
+    Avoid dates, phone numbers, pure IDs, and address-like lines.
+    """
+    if not block:
+        return None
+
+    lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+    if not lines:
+        # If it was same-line content without newlines
+        lines = [block.strip()]
+
+    def bad_line(ln: str) -> bool:
+        u = ln.upper()
+        if re.search(r"\b\d{4}-\d{2}-\d{2}\b", ln):
+            return True
+        if re.search(r"\b[A-Za-z]+\s+\d{1,2},\s*\d{4}\b", ln):
+            return True
+        if re.search(r"\b\d{3}[- ]?\d{3}[- ]?\d{4}\b", ln):
+            return True
+        if re.fullmatch(r"[\d\s\-/.,]+", ln):
+            return True
+        if "HTTP" in u or "WWW." in u:
+            return True
+        if "USD" in u or "USDT" in u:
+            return True
+        return False
+
+    def looks_like_address(ln: str) -> bool:
+        # Very rough address heuristics
+        if re.search(r"\b(ST|STREET|AVE|AVENUE|RD|ROAD|BLVD|DR|WAY|HWY)\b", ln.upper()):
+            return True
+        if re.search(r"\b\d{2,6}\b", ln) and re.search(r"[A-Za-z]", ln):
+            return True
+        return False
+
+    for ln in lines:
+        if bad_line(ln):
+            continue
+        if looks_like_address(ln):
+            continue
+        # Must contain letters
+        if not re.search(r"[A-Za-z]", ln):
+            continue
+        # Keep it within a reasonable length
+        if 2 <= len(ln) <= 120:
+            return ln.strip()
+
+    return None
 
 
-RECIPIENT_LABELS = ["RECIPIENT", "RECIPENT", "RECEPIENT", "RECIPlENT"]
-RECIPIENT_BANK_LABELS = ["RECIPIENT BANK", "RECIPENT BANK", "RECEPIENT BANK"]
-
-
-# -----------------------------
-# Rule-based doc type + extraction
-# -----------------------------
 def detect_doc_type(text: str) -> str:
     u = text.upper() if text else ""
     if "CHASE" in u and "WIRE" in u:
@@ -226,59 +298,68 @@ def extract_financial_fields_rule(clean_text: str) -> dict:
     text = clean_text
     u = text.upper()
 
+    # -----------------------------
     # Chase wire
+    # -----------------------------
     if "CHASE" in u and "WIRE" in u:
-        m = compile_line_after_label("SENDER").search(text)
-        if m:
-            fields["SenderName"] = m.group(1).strip()
+        sender_block = _block_after_label(text, "SENDER")
+        fields["SenderName"] = _pick_name_from_block(sender_block)
 
-        if not fields["RecipientName"]:
-            for lbl in RECIPIENT_LABELS:
-                m = compile_line_after_label(lbl).search(text)
-                if m:
-                    fields["RecipientName"] = m.group(1).strip()
-                    break
-
-        for lbl in RECIPIENT_BANK_LABELS:
-            m = compile_line_after_label(lbl).search(text)
-            if m:
-                fields["RecipientBank"] = m.group(1).strip()
+        # Recipient label variants (OCR misspells)
+        for lbl in ["RECIPIENT", "RECIPENT", "RECEPIENT", "RECIPlENT"]:
+            rec_block = _block_after_label(text, lbl)
+            v = _pick_name_from_block(rec_block)
+            if v:
+                fields["RecipientName"] = v
                 break
 
-        date_tail = r"\s*[:\-]?\s*([A-Za-z]+\s+\d{1,2},\s*\d{4})"
-        m = compile_after_label("Wire Transfer Date", date_tail).search(text)
-        if not m:
-            m = compile_after_label("Today's Date", date_tail).search(text)
-        if m:
-            fields["TransferDate"] = m.group(1).strip()
+        for lbl in ["RECIPIENT BANK", "RECIPENT BANK", "RECEPIENT BANK"]:
+            bank_block = _block_after_label(text, lbl, max_chars=600)
+            v = _pick_name_from_block(bank_block) or (bank_block.splitlines()[0].strip() if bank_block else None)
+            if v:
+                fields["RecipientBank"] = v
+                break
 
-        amount_tail = r"\s*[:\-]?\s*\$?\s*([\d]{1,3}(?:[,]\d{3})*(?:\.\d{2})?\s*[A-Z]{3})"
-        m = compile_after_label("Transfer Amount", amount_tail).search(text)
+        # Dates (wire transfer date / today's date)
+        m = re.search(
+            r"(?i)(Wire\s*Transfer\s*Date|Today'?s\s*Date)\s*[:\-]?\s*([A-Za-z]+\s+\d{1,2},\s*\d{4})",
+            text,
+        )
+        if m:
+            fields["TransferDate"] = m.group(2).strip()
+
+        # Amount / fees
+        m = re.search(
+            r"(?i)Transfer\s*Amount\s*[:\-]?\s*\$?\s*([\d]{1,3}(?:,\d{3})*(?:\.\d{2})?\s*[A-Z]{3})",
+            text,
+        )
         if m:
             fields["TransferAmount"] = m.group(1).strip()
 
-        fees_tail = r"\s*[:\-]?\s*\+?\$?\s*([\d,]+(?:\.\d{2})?\s*[A-Z]{3})"
-        m = compile_after_label("Transfer Fees", fees_tail).search(text)
-        if not m:
-            m = compile_after_label("Other Fees", fees_tail).search(text)
+        m = re.search(
+            r"(?i)(Transfer\s*Fees|Other\s*Fees)\s*[:\-]?\s*\+?\$?\s*([\d]{1,3}(?:,\d{3})*(?:\.\d{2})?\s*[A-Z]{3})",
+            text,
+        )
         if m:
-            fields["Fee"] = m.group(1).strip()
+            fields["Fee"] = m.group(2).strip()
 
+    # -----------------------------
     # Binance withdrawal
+    # -----------------------------
     if ("BINANCE" in u) or ("USDT" in u) or ("TXID" in u) or ("WITHDRAWAL" in u):
-        m = compile_after_label("Amount", r"\s*[\r\n]+\s*([\d,]+\s*[A-Z]+)").search(text)
+        m = re.search(r"(?is)\bAmount\b.*?\n\s*([\d,]+\s*[A-Z]+)", text)
         if m:
             fields["Asset"] = m.group(1).strip()
 
-        m = compile_after_label("Network", r"\s*[\r\n]+\s*([A-Z0-9\-]+)").search(text)
+        m = re.search(r"(?is)\bNetwork\b.*?\n\s*([A-Z0-9\-]+)", text)
         if m:
             fields["Network"] = m.group(1).strip()
 
-        m = compile_after_label("Address", r"\s*[\r\n]+\s*([A-Za-z0-9]+)").search(text)
+        m = re.search(r"(?is)\bAddress\b.*?\n\s*([A-Za-z0-9]+)", text)
         if m:
             fields["WalletAddress"] = m.group(1).strip()
 
-        m = compile_after_label("Txid", r"\s*[\r\n]+\s*([A-Fa-f0-9]+)").search(text)
+        m = re.search(r"(?is)\bTxid\b.*?\n\s*([A-Fa-f0-9]{20,})", text)
         if m:
             fields["TxID"] = m.group(1).strip()
 
@@ -288,7 +369,7 @@ def extract_financial_fields_rule(clean_text: str) -> dict:
                 fields["TransferDate"] = m.group(1).strip()
 
         if not fields["Fee"]:
-            m = compile_after_label("Network fee", r"\s*[\r\n]+\s*([\d.,]+\s*[A-Z]+)").search(text)
+            m = re.search(r"(?is)\bNetwork\s*fee\b.*?\n\s*([\d.,]+\s*[A-Z]+)", text)
             if m:
                 fields["Fee"] = m.group(1).strip()
 
@@ -310,6 +391,7 @@ def extract_financial_fields_rule(clean_text: str) -> dict:
 # Filename sanitization
 # -----------------------------
 def sanitize_basename(s: str) -> str:
+    """Sanitize a base filename (no extension)."""
     s = (s or "").strip()
     if not s:
         s = "ocr_results"
@@ -337,13 +419,14 @@ with st.sidebar:
     st.divider()
 
     st.subheader("Extraction Options")
-    collapse_ws = st.checkbox("Collapse whitespace/newlines", value=True)
+    collapse_ws = st.checkbox("Collapse whitespace/newlines (keep structure)", value=True)
 
     use_ai_agent = st.checkbox("Use AI Agent (ChatGPT)", value=False)
     ai_model = st.text_input("AI model (OpenAI)", value="gpt-5")
     st.caption("Requires OPENAI_API_KEY in your environment. If missing, AI Agent will be skipped.")
 
     include_text_cols = st.checkbox("Include Raw/Clean text columns in CSV/Excel", value=False)
+    show_debug_text = st.checkbox("Show debug text (Raw/Clean) in UI", value=True)
 
 results = []
 
@@ -374,6 +457,8 @@ with tab2:
 
 if results:
     rows = []
+    debug_payload = []
+
     for r in results:
         filename = r.get("filename")
         raw = r.get("raw_text", "") or ""
@@ -382,26 +467,29 @@ if results:
         rule = extract_financial_fields_rule(clean)
 
         agent = {}
-        if use_ai_agent:
-            agent = extract_fields_with_agent(clean, model=ai_model)
+        agent_conf = None
+        if use_ai_agent and extract_fields_with_agent is not None:
+            agent = extract_fields_with_agent(clean_text=clean, raw_text=raw, model=ai_model)
+            agent_conf = agent.get("confidence")
 
         # Merge: prefer agent value, fallback to rule
         merged = {}
         for k in rule.keys():
-            merged[k] = agent.get(k) or rule.get(k)
+            merged[k] = (agent.get(k) if agent else None) or rule.get(k)
 
-        # Conflict detection
+        # Conflict detection (only meaningful if both present)
         conflicts = []
-        for k in rule.keys():
-            rv = rule.get(k)
-            av = agent.get(k)
-            if rv and av and str(rv) != str(av):
-                conflicts.append(k)
+        if agent:
+            for k in rule.keys():
+                rv = rule.get(k)
+                av = agent.get(k)
+                if rv and av and str(rv) != str(av):
+                    conflicts.append(k)
 
         row = {
             "Filename": filename,
             **merged,
-            "AI_confidence": agent.get("confidence") if agent else None,
+            "AI_confidence": agent_conf,
             "Conflicts": ";".join(conflicts) if conflicts else "",
         }
 
@@ -410,8 +498,8 @@ if results:
             row["CleanText"] = clean
 
         rows.append(row)
+        debug_payload.append({"Filename": filename, "RawText": raw, "CleanText": clean})
 
-    # Excel/CSV columns: only "needed fields" by default
     base_cols = [
         "Filename",
         "DocumentType",
@@ -432,7 +520,6 @@ if results:
         base_cols += ["RawText", "CleanText"]
 
     df = pd.DataFrame(rows)
-    # Ensure column order (ignore missing)
     cols = [c for c in base_cols if c in df.columns]
     df = df[cols]
 
@@ -444,6 +531,16 @@ if results:
     c2.metric("DocType detected", int((df["DocumentType"] != "OTHER").sum()) if "DocumentType" in df else 0)
     c3.metric("WalletAddress detected", int(df["WalletAddress"].notna().sum()) if "WalletAddress" in df else 0)
     c4.metric("TxID detected", int(df["TxID"].notna().sum()) if "TxID" in df else 0)
+
+    if show_debug_text:
+        st.subheader("Debug (Raw/Clean text)")
+        st.caption("If Sender/Recipient is missing, check whether OCR output contains the labels and nearby lines.")
+        for item in debug_payload:
+            with st.expander(f"Text view: {item['Filename']}"):
+                st.markdown("**RawText**")
+                st.text(item["RawText"][:12000] if item["RawText"] else "")
+                st.markdown("**CleanText**")
+                st.text(item["CleanText"][:12000] if item["CleanText"] else "")
 
     # CSV download
     st.download_button(

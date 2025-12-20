@@ -32,15 +32,13 @@ SCHEMA_KEYS = [
 
 
 def _extract_json_object(text: str) -> Dict[str, Any]:
-    """
-    Best-effort extraction of the first JSON object found in the model output.
-    We intentionally avoid brittle assumptions (models sometimes wrap JSON with text).
-    """
+    """Best-effort extraction of the first JSON object found in model output."""
     if not text:
         return {}
 
-    # Fast path: if the whole text is valid JSON
     t = text.strip()
+
+    # Fast path: whole response is JSON
     try:
         obj = json.loads(t)
         if isinstance(obj, dict):
@@ -48,8 +46,7 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # Find the first {...} block (non-greedy) and attempt to parse
-    # This is not perfect but works well in practice for "JSON only" prompts.
+    # Find first {...} block
     m = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if not m:
         return {}
@@ -87,13 +84,11 @@ def _normalize_agent_result(d: Dict[str, Any]) -> Dict[str, Any]:
         if k in d:
             out[k] = d.get(k)
 
-    # Normalize strings
     for k in SCHEMA_KEYS:
         if k == "confidence":
             continue
         out[k] = _normalize_value(out[k])
 
-    # Normalize confidence
     c = out.get("confidence")
     try:
         cf = float(c) if c is not None else 0.0
@@ -102,52 +97,45 @@ def _normalize_agent_result(d: Dict[str, Any]) -> Dict[str, Any]:
     cf = max(0.0, min(1.0, cf))
     out["confidence"] = cf
 
-    # Light canonicalization
-    if out.get("WalletAddress"):
-        out["WalletAddress"] = out["WalletAddress"].replace("O", "0") if out["WalletAddress"].startswith("0x") else out["WalletAddress"]
-        out["WalletAddress"] = out["WalletAddress"].strip()
-    if out.get("TxID"):
-        out["TxID"] = out["TxID"].strip()
-
     return out
 
 
-def build_prompt(clean_text: str) -> str:
+def build_prompt(clean_text: str, raw_text: str = "") -> str:
     """
-    Agent prompt: force a strict JSON contract.
-    Keep it short and operational to reduce hallucination.
+    Extraction prompt:
+    - Force strict JSON contract
+    - Explicitly instruct to look around labels even with OCR spacing noise
     """
+    # Keep it short but operational
     return (
         "You are an information extraction agent.\n"
-        "Extract ONLY the following fields from the text and return ONE JSON object.\n"
+        "Return ONE JSON object only.\n"
         "\n"
-        "Keys (must exist in JSON):\n"
-        "- DocumentType: one of CHASE_WIRE, BINANCE_WITHDRAWAL, OTHER\n"
-        "- SenderName\n"
-        "- RecipientName\n"
-        "- RecipientBank\n"
-        "- TransferDate\n"
-        "- TransferAmount\n"
-        "- Fee\n"
-        "- Asset\n"
-        "- WalletAddress\n"
-        "- TxID\n"
-        "- Network\n"
-        "- confidence: number between 0.0 and 1.0\n"
+        "Keys (must exist):\n"
+        "DocumentType, SenderName, RecipientName, RecipientBank, TransferDate, TransferAmount, Fee, Asset, WalletAddress, TxID, Network, confidence\n"
+        "\n"
+        "DocumentType must be one of: CHASE_WIRE, BINANCE_WITHDRAWAL, OTHER\n"
         "\n"
         "Rules:\n"
-        "- Return JSON only. No prose.\n"
-        "- If a field is unknown, use null.\n"
-        "- Do not invent values. Use the text only.\n"
-        "- Prefer exact substrings from the text.\n"
+        "- JSON only. No prose.\n"
+        "- If unknown, use null.\n"
+        "- Do NOT invent. Use the text only.\n"
+        "- Prefer exact substrings.\n"
+        "- For fields like Sender/Recipient/Bank, look near labels like:\n"
+        "  SENDER, RECIPIENT, RECIPIENT BANK, Wire Transfer Date, Transfer Amount, Transfer Fees, Txid, Address, Network.\n"
+        "- OCR may insert spaces (e.g., S E N D E R) or miss punctuation; still infer using nearby lines.\n"
         "\n"
-        "TEXT:\n"
+        "CLEAN_TEXT:\n"
         f"{clean_text}\n"
+        "\n"
+        "RAW_TEXT (may contain more line breaks):\n"
+        f"{raw_text}\n"
     )
 
 
 def extract_fields_with_agent(
     clean_text: str,
+    raw_text: str = "",
     model: str = "gpt-5",
     api_key: Optional[str] = None,
     timeout_s: int = 60,
@@ -167,11 +155,8 @@ def extract_fields_with_agent(
         return {}
 
     client = OpenAI(api_key=key)
+    prompt = build_prompt(clean_text=clean_text, raw_text=raw_text)
 
-    prompt = build_prompt(clean_text)
-
-    # Responses API call (recommended for new projects)
-    # https://platform.openai.com/docs/api-reference/responses
     resp = client.responses.create(
         model=model,
         input=prompt,
@@ -180,5 +165,4 @@ def extract_fields_with_agent(
 
     out_text = getattr(resp, "output_text", "") or ""
     raw_obj = _extract_json_object(out_text)
-    norm = _normalize_agent_result(raw_obj)
-    return norm
+    return _normalize_agent_result(raw_obj)
