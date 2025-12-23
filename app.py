@@ -1,5 +1,5 @@
 # app.py
-<<<<<<< HEAD
+
 # Fraud OCR Extractor: OCR -> Text Clean -> Rule Extraction (+ Optional AI Agent) -> Excel/CSV + Readable TXT
 # 2025-12-20
 
@@ -47,7 +47,7 @@ def _auto_set_tesseract():
 
 
 _auto_set_tesseract()
-=======
+
 from __future__ import annotations
 
 import io
@@ -970,4 +970,4 @@ with tab4:
         with col3:
             json_bytes = json.dumps(result_json, ensure_ascii=False, indent=2).encode("utf-8")
             st.download_button("Download JSON", data=json_bytes, file_name="extracted.json", mime="application/json")
->>>>>>> 3429900 (Remove temporary app file and add AI-driven OCR extractor)
+3429900 (Remove temporary app file and add AI-driven OCR extractor)
